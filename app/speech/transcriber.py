@@ -14,6 +14,24 @@ from pathlib import Path
 from datetime import datetime
 
 
+def list_input_devices():
+    """Print available input devices and return a list of (index, name) tuples.
+
+    Useful for finding the correct input_device_index to pass to AudioRecorder.record.
+    """
+    p = pyaudio.PyAudio()
+    devices = []
+    try:
+        for i in range(p.get_device_count()):
+            info = p.get_device_info_by_index(i)
+            if info.get('maxInputChannels', 0) > 0:
+                devices.append((i, info.get('name')))
+                print(f"{i}: {info.get('name')} (inputs={info.get('maxInputChannels')}, rate={info.get('defaultSampleRate')})")
+    finally:
+        p.terminate()
+    return devices
+
+
 class AudioRecorder:
     """Records audio from microphone to a WAV file."""
     
@@ -29,9 +47,10 @@ class AudioRecorder:
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
         self.channels = channels
-        self.audio_format = pyaudio.paFloat32
+        # Use 16-bit PCM for compatibility with WAV/FFmpeg
+        self.audio_format = pyaudio.paInt16
         
-    def record(self, output_file, duration_seconds=10, silence_threshold=0.02):
+    def record(self, output_file, duration_seconds=10, silence_threshold=0.02, input_device_index=None, playback=False):
         """
         Record audio from microphone.
         
@@ -39,6 +58,8 @@ class AudioRecorder:
             output_file: Path to save the .wav file.
             duration_seconds: How long to record (default 10 seconds).
             silence_threshold: Stop early if silence is detected (optional).
+            input_device_index: Optional PyAudio device index to use for input. If None, uses default device.
+            playback: If True, play back the recording after saving for quick verification.
         
         Returns:
             True if recording successful, False otherwise.
@@ -49,29 +70,52 @@ class AudioRecorder:
         try:
             p = pyaudio.PyAudio()
             
-            # Open microphone stream
-            stream = p.open(
+            # Probe the selected or default input device for its preferred sample rate and channel count
+            try:
+                if input_device_index is not None:
+                    dev_info = p.get_device_info_by_index(int(input_device_index))
+                else:
+                    dev_info = p.get_default_input_device_info()
+                device_rate = int(dev_info.get('defaultSampleRate', self.sample_rate))
+                device_channels = int(dev_info.get('maxInputChannels', self.channels))
+            except Exception:
+                # Fallback to configured values if probing fails
+                device_rate = self.sample_rate
+                device_channels = self.channels
+
+            # Use device capabilities (fall back to configured values)
+            rate = device_rate
+            channels = min(self.channels, device_channels) if device_channels > 0 else self.channels
+
+            # Open microphone stream with device-safe parameters
+            open_kwargs = dict(
                 format=self.audio_format,
-                channels=self.channels,
-                rate=self.sample_rate,
+                channels=channels,
+                rate=rate,
                 input=True,
                 frames_per_buffer=self.chunk_size
             )
-            
+            if input_device_index is not None:
+                open_kwargs['input_device_index'] = int(input_device_index)
+
+            stream = p.open(**open_kwargs)
+
             frames = []
             silent_frames = 0
-            max_silent_frames = int(self.sample_rate / self.chunk_size * 2)  # 2 seconds of silence
+            max_silent_frames = int(rate / self.chunk_size * 2)  # 2 seconds of silence
             
-            # Record audio
-            for i in range(0, int(self.sample_rate / self.chunk_size * duration_seconds)):
+            # Record audio (use device-selected rate)
+            for i in range(0, int(rate / self.chunk_size * duration_seconds)):
                 try:
                     data = stream.read(self.chunk_size, exception_on_overflow=False)
                     frames.append(data)
                     
                     # Simple silence detection (optional early stop)
                     import numpy as np
-                    audio_data = np.frombuffer(data, dtype=np.float32)
-                    volume = np.abs(audio_data).mean()
+                    # Read as 16-bit PCM to match the stream format
+                    audio_data = np.frombuffer(data, dtype=np.int16)
+                    # Normalize volume to 0..1 using the dtype max so threshold can be a float
+                    volume = np.abs(audio_data).mean() / float(np.iinfo(audio_data.dtype).max)
                     
                     if volume < silence_threshold:
                         silent_frames += 1
@@ -87,19 +131,43 @@ class AudioRecorder:
             
             stream.stop_stream()
             stream.close()
+
+            # Retrieve sample width before terminating PyAudio
+            sample_width = p.get_sample_size(self.audio_format)
             p.terminate()
             
-            # Save to WAV file
+            # Save to WAV file using the actual stream parameters (rate, channels)
             output_file = Path(output_file)
             output_file.parent.mkdir(parents=True, exist_ok=True)
             
             with wave.open(str(output_file), 'wb') as wf:
-                wf.setnchannels(self.channels)
-                wf.setsampwidth(p.get_sample_size(self.audio_format))
-                wf.setframerate(self.sample_rate)
+                wf.setnchannels(channels)
+                wf.setsampwidth(sample_width)
+                wf.setframerate(rate)
                 wf.writeframes(b''.join(frames))
             
             print(f"✓ Saved to {output_file}")
+
+            # Optional playback for verification
+            if playback:
+                try:
+                    print("▶ Playing back recording for verification...")
+                    p_play = pyaudio.PyAudio()
+                    stream_out = p_play.open(
+                        format=self.audio_format,
+                        channels=channels,
+                        rate=rate,
+                        output=True,
+                        frames_per_buffer=self.chunk_size
+                    )
+                    for chunk in frames:
+                        stream_out.write(chunk)
+                    stream_out.stop_stream()
+                    stream_out.close()
+                    p_play.terminate()
+                except Exception as e:
+                    print(f"⚠️ Playback failed: {e}")
+
             return True
             
         except Exception as e:
@@ -153,7 +221,7 @@ class SpeechTranscriber:
             return None
 
 
-def record_and_transcribe(duration_seconds=10, model_name="base"):
+def record_and_transcribe(duration_seconds=10, model_name="base", input_device_index=None, playback=False):
     """
     Simple helper: record audio and transcribe in one call.
     
@@ -170,7 +238,7 @@ def record_and_transcribe(duration_seconds=10, model_name="base"):
     
     # Record
     recorder = AudioRecorder()
-    if not recorder.record(audio_file, duration_seconds=duration_seconds):
+    if not recorder.record(audio_file, duration_seconds=duration_seconds, input_device_index=input_device_index, playback=playback):
         return None
     
     # Transcribe
