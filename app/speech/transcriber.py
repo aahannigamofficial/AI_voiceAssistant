@@ -256,9 +256,20 @@ def record_and_transcribe(duration_seconds=10, model_name="base", input_device_i
     Returns:
         Recognized text (string), or None if failed.
     """
+    # Keep the temporary recording directory bounded across continuous runs.
+    temp_directory = Path("./temp")
+    temp_directory.mkdir(parents=True, exist_ok=True)
+    audio_files = sorted(
+        temp_directory.glob("audio_*.wav"),
+        key=lambda path: path.stat().st_mtime,
+    )
+    if len(audio_files) >= 10:
+        for old_audio in audio_files[:5]:
+            old_audio.unlink()
+
     # Create temp audio file
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    audio_file = Path("./temp") / f"audio_{timestamp}.wav"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    audio_file = temp_directory / f"audio_{timestamp}.wav"
     
     # Record
     recorder = AudioRecorder()
