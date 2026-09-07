@@ -50,7 +50,7 @@ class AudioRecorder:
         # Use 16-bit PCM for compatibility with WAV/FFmpeg
         self.audio_format = pyaudio.paInt16
         
-    def record(self, output_file, duration_seconds=10, silence_threshold=0.02, input_device_index=None, playback=False):
+    def record(self, output_file, duration_seconds=10, silence_threshold=0.01, min_speech_seconds=0.5, input_device_index=None, playback=False):
         """
         Record audio from microphone.
         
@@ -102,28 +102,38 @@ class AudioRecorder:
 
             frames = []
             silent_frames = 0
-            max_silent_frames = int(rate / self.chunk_size * 2)  # 2 seconds of silence
+            # How many consecutive silent frames count as "silence stop" (2 seconds default)
+            max_silent_frames = int(rate / self.chunk_size * 2)
+            # How many voiced frames required before allowing early-silence stop
+            required_speech_frames = int(max(1, (min_speech_seconds * rate) / self.chunk_size))
+            speech_frames_count = 0
             
             # Record audio (use device-selected rate)
-            for i in range(0, int(rate / self.chunk_size * duration_seconds)):
+            max_rms_norm = 0.0
+            for _ in range(0, int(rate / self.chunk_size * duration_seconds)):
                 try:
                     data = stream.read(self.chunk_size, exception_on_overflow=False)
                     frames.append(data)
                     
-                    # Simple silence detection (optional early stop)
+                    # Simple silence detection (optional early stop) using RMS
                     import numpy as np
                     # Read as 16-bit PCM to match the stream format
-                    audio_data = np.frombuffer(data, dtype=np.int16)
-                    # Normalize volume to 0..1 using the dtype max so threshold can be a float
-                    volume = np.abs(audio_data).mean() / float(np.iinfo(audio_data.dtype).max)
+                    audio_data = np.frombuffer(data, dtype=np.int16).astype('float32')
+                    # Compute RMS and normalize to 0..1
+                    rms = np.sqrt(np.mean(audio_data ** 2))
+                    max_int = float(np.iinfo(np.int16).max)
+                    rms_norm = rms / max_int if max_int > 0 else 0.0
+                    max_rms_norm = max(max_rms_norm, rms_norm)
                     
-                    if volume < silence_threshold:
+                    if rms_norm < silence_threshold:
                         silent_frames += 1
-                        if silent_frames > max_silent_frames and len(frames) > 10:
+                        # Only allow early stop if we've seen enough speech already
+                        if silent_frames > max_silent_frames and speech_frames_count >= required_speech_frames:
                             print("   (Silence detected, stopping early)")
                             break
                     else:
                         silent_frames = 0
+                        speech_frames_count += 1
                     
                 except KeyboardInterrupt:
                     print("   (Recording cancelled)")
@@ -147,6 +157,16 @@ class AudioRecorder:
                 wf.writeframes(b''.join(frames))
             
             print(f"✓ Saved to {output_file}")
+
+            # Do not send an effectively silent capture to Whisper, which can
+            # hallucinate short words such as "You".
+            if max_rms_norm < 0.001:
+                print(
+                    "⚠️ Microphone input is nearly silent "
+                    f"(peak RMS={max_rms_norm:.6f}). Check the selected "
+                    "microphone and its Windows input level."
+                )
+                return False
 
             # Optional playback for verification
             if playback:
@@ -207,10 +227,14 @@ class SpeechTranscriber:
         """
         try:
             print(f"\n🔄 Transcribing {audio_file}...")
-            segments, info = self.model.transcribe(
+            segments, _ = self.model.transcribe(
                 str(audio_file),
                 language="en",  # Specify English
-                beam_size=5
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 500},
+                no_speech_threshold=0.6,
+                condition_on_previous_text=False,
             )
             # Collect all segments into full text
             text = " ".join([segment.text for segment in segments]).strip()
@@ -221,7 +245,7 @@ class SpeechTranscriber:
             return None
 
 
-def record_and_transcribe(duration_seconds=10, model_name="base", input_device_index=None, playback=False):
+def record_and_transcribe(duration_seconds=10, model_name="base", input_device_index=None, playback=False, silence_threshold=0.01, min_speech_seconds=0.5):
     """
     Simple helper: record audio and transcribe in one call.
     
@@ -238,7 +262,7 @@ def record_and_transcribe(duration_seconds=10, model_name="base", input_device_i
     
     # Record
     recorder = AudioRecorder()
-    if not recorder.record(audio_file, duration_seconds=duration_seconds, input_device_index=input_device_index, playback=playback):
+    if not recorder.record(audio_file, duration_seconds=duration_seconds, silence_threshold=silence_threshold, min_speech_seconds=min_speech_seconds, input_device_index=input_device_index, playback=playback):
         return None
     
     # Transcribe
