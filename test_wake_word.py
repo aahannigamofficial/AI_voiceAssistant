@@ -2,7 +2,7 @@
 Phase 1, Step 2: Wake-Word Detection Demo
 
 This script:
-1. Listens continuously for "Hey Mycroft"
+1. Listens for "Hey Mycroft" once
 2. When detected, records the command
 3. Transcribes the command
 4. Prints the result
@@ -28,31 +28,30 @@ def main():
     # Initialize wake-word detector
     detector = WakeWordDetector(wake_word="hey_mycroft", sensitivity=0.5)
     
-    while True:
-        print("\n" + "="*60)
-        print("Waiting for wake word...")
-        print("="*60)
+    print("\n" + "="*60)
+    print("Waiting for wake word...")
+    print("="*60)
+    
+    # Listen for the wake word once, then return so the next activation
+    # requires a new run of the detector.
+    if detector.listen_for_wake_word(timeout_seconds=300):
+        # Wake word detected! Now record the command
+        print("\n" + "-"*60)
+        print("Recording your command...")
+        print("-"*60)
         
-        # Listen for wake word (with 5 minute timeout)
-        if detector.listen_for_wake_word(timeout_seconds=300):
-            # Wake word detected! Now record the command
-            print("\n" + "-"*60)
-            print("Recording your command...")
-            print("-"*60)
-            
-            text = record_and_transcribe(duration_seconds=10, model_name="base")
-            
-            if text:
-                print("\n" + "="*60)
-                print("RECOGNIZED COMMAND")
-                print("="*60)
-                print(f"You said: \"{text}\"")
-                print("="*60)
-            else:
-                print("\n❌ Failed to transcribe command.")
+        text = record_and_transcribe(duration_seconds=10, model_name="base")
+        
+        if text:
+            print("\n" + "="*60)
+            print("RECOGNIZED COMMAND")
+            print("="*60)
+            print(f"You said: \"{text}\"")
+            print("="*60)
         else:
-            print("\nNo wake word detected. Exiting.")
-            break
+            print("\n❌ Failed to transcribe command.")
+    else:
+        print("\nNo wake word detected. Exiting.")
 
 
 if __name__ == "__main__":
